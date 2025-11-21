@@ -5,7 +5,8 @@ from fastapi import FastAPI
 
 from app.core.config import settings
 from app.core.database import Base, engine
-from app.models import Agent, Tool, AgentTool  # Import models to register them
+from app.models import Agent, Tool  # Import models to register them
+from app.api.agent import router as agent_router
 
 
 # Initialize FastAPI app
@@ -15,6 +16,9 @@ app = FastAPI(
     version="0.1.0",
     debug=settings.debug,
 )
+
+# Register routers
+app.include_router(agent_router)
 
 
 @app.on_event("startup")

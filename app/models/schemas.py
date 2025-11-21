@@ -69,23 +69,9 @@ class AgentUpdate(BaseModel):
 class AgentResponse(AgentBase):
     """Schema for agent response with tools."""
     ag_id: UUID
-    tools: List[ToolResponse] = Field(default_factory=list, description="List of associated tools")
+    tool_ids: Optional[List[UUID]] = Field(default_factory=list, description="List of tool IDs")
     created_at: datetime
     updated_at: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
-
-
-# ============================================
-# Agent-Tool Relationship Schemas
-# ============================================
-
-class AgentToolResponse(BaseModel):
-    """Schema for agent-tool relationship response."""
-    agent_id: UUID
-    tool_id: UUID
-    created_at: datetime
 
     class Config:
         from_attributes = True
