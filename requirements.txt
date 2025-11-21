@@ -11,8 +11,8 @@ sqlalchemy
 alembic
 psycopg2-binary
 
-# LLM - OpenAI-compatible API (for Cerebras GPT-Oss-120B)
-openai
+# LLM - Cerebras SDK
+cerebras-cloud-sdk
 
 # STT - Deepgram
 deepgram-sdk
