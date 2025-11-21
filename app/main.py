@@ -5,9 +5,11 @@ import logging
 from fastapi import FastAPI
 
 from app.core.config import settings
-from app.core.database import Base, engine
-from app.models import Agent, Tool, AgentTool  # Import models to register them
+from app.core.database import Base, engine # Import models to register them
 from app.api.twilio_routes import router as twilio_router  # Import Twilio routes
+from app.models import Agent, Tool  # Import models to register them
+from app.api.agent import router as agent_router
+
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +29,8 @@ app = FastAPI(
 
 # Register routes
 app.include_router(twilio_router)
+# Register routers
+app.include_router(agent_router)
 
 
 @app.on_event("startup")
