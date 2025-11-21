@@ -3,7 +3,7 @@ Database initialization script.
 Automatically creates all tables in PostgreSQL.
 """
 from app.core.database import Base, engine
-from app.models import Agent, Tool, AgentTool  # Import all models
+from app.models import Agent, Tool  # Import all models
 
 
 def init_db():
