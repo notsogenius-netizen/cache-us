@@ -1,9 +1,41 @@
+# Core Framework
 fastapi
-uvicorn
-sqlalchemy
+uvicorn[standard]
+websockets
+python-multipart
 pydantic
-python-dotenv
-psycopg2
-pgvector
+pydantic-settings
+
+# Database
+sqlalchemy
+alembic
+psycopg2-binary
+
+# LLM - OpenAI-compatible API (for Cerebras GPT-Oss-120B)
 openai
+
+# STT - Deepgram
+deepgram-sdk
+
+# TTS - ElevenLabs
+elevenlabs
+
+# Vector DB - FAISS
+faiss-cpu
+
+# Embeddings - HuggingFace SentenceTransformers
+sentence-transformers
+
+# Twilio
+twilio
+
+# Utilities
+python-dotenv
 httpx
+aiofiles
+
+# Development & Testing (optional but recommended)
+pytest
+pytest-asyncio
+black
+ruff
