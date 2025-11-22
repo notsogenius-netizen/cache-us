@@ -38,6 +38,9 @@ class ConversationContext:
         self.created_at = datetime.now()
         self.last_activity = datetime.now()
         self.stream_sid: Optional[str] = None  # Stream SID for sending audio back
+        # TTS interruption state
+        self.active_tts_task: Optional[asyncio.Task] = None  # Track active TTS sending task
+        self.tts_cancellation_event: Optional[asyncio.Event] = None  # Event to signal TTS cancellation
 
     def add_user_message(self, text: str):
         """Add user message to conversation history."""

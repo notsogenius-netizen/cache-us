@@ -76,25 +76,31 @@ class LLMService:
         return formatted_tools
 
     def _format_conversation_history(
-        self, conversation_history: List[Dict[str, str]]
-    ) -> List[Dict[str, str]]:
+        self, conversation_history: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         """
         Format conversation history for OpenAI API.
+        Preserves all message fields including tool_calls, function_call, etc.
 
         Args:
-            conversation_history: List of message dicts with 'role' and 'content'
+            conversation_history: List of message dicts with 'role', 'content', and optionally 'tool_calls' or 'function_call'
 
         Returns:
             Formatted messages for OpenAI API
         """
         formatted_messages = []
         for msg in conversation_history:
-            formatted_messages.append(
-                {
-                    "role": msg.get("role", "user"),
-                    "content": msg.get("content", ""),
-                }
-            )
+            formatted_msg = {
+                "role": msg.get("role", "user"),
+                "content": msg.get("content", ""),
+            }
+            # Preserve tool_calls if present (for assistant messages with tool calls)
+            if "tool_calls" in msg:
+                formatted_msg["tool_calls"] = msg["tool_calls"]
+            # Preserve function_call if present (legacy format)
+            if "function_call" in msg:
+                formatted_msg["function_call"] = msg["function_call"]
+            formatted_messages.append(formatted_msg)
         return formatted_messages
 
     async def generate_response(
@@ -176,11 +182,29 @@ Context from Knowledge Base:
                     except json.JSONDecodeError:
                         tool_arguments = {}
                 
+                # Extract tool_call_id if available
+                tool_call_id = getattr(tool_call, "id", "call_1")
+                
                 return {
                     "type": "tool_call",
                     "tool_name": tool_call.function.name,
                     "tool_arguments": tool_arguments,
+                    "tool_call_id": tool_call_id,
                     "content": message.content or "",
+                    "assistant_message": {
+                        "role": "assistant",
+                        "content": message.content or "",
+                        "tool_calls": [
+                            {
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": json.dumps(tool_arguments) if isinstance(tool_arguments, dict) else str(tool_arguments)
+                                }
+                            }
+                        ]
+                    }
                 }
             elif hasattr(message, "function_call") and message.function_call:
                 # Old format: function_call (single)
@@ -219,6 +243,7 @@ Context from Knowledge Base:
         tool_name: str,
         tool_result: str,
         tools: List[Tool],
+        tool_call_id: Optional[str] = "call_1",
     ) -> Dict[str, Any]:
         """
         Generate LLM response after tool execution.
@@ -235,11 +260,15 @@ Context from Knowledge Base:
         """
         # Build messages with tool result
         messages = [{"role": "system", "content": agent_prompt}]
-        messages.extend(self._format_conversation_history(conversation_history))
+        history_messages = self._format_conversation_history(conversation_history)
+        messages.extend(history_messages)
         
         # Add tool execution result
+        # Cerebras API expects 'tool' role, not 'function' role
+        # The tool result must come after the assistant's message with the tool call
         messages.append({
-            "role": "function",
+            "role": "tool",
+            "tool_call_id": tool_call_id,
             "name": tool_name,
             "content": tool_result,
         })
@@ -278,10 +307,14 @@ Context from Knowledge Base:
                     except json.JSONDecodeError:
                         tool_arguments = {}
                 
+                # Extract tool_call_id if available
+                tool_call_id = getattr(tool_call, "id", "call_1")
+                
                 return {
                     "type": "tool_call",
                     "tool_name": tool_call.function.name,
                     "tool_arguments": tool_arguments,
+                    "tool_call_id": tool_call_id,
                     "content": message.content or "",
                 }
             elif hasattr(message, "function_call") and message.function_call:

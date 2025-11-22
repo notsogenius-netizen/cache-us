@@ -5,6 +5,7 @@ import json
 import logging
 import asyncio
 import base64
+import time
 from typing import Optional, Dict, Any
 from fastapi import WebSocket, WebSocketDisconnect
 import websockets
@@ -172,13 +173,60 @@ class TwilioWebSocketHandler:
             transcribed_text_buffer = []
             current_transcription = ""
 
-            async def on_transcript(text: str):
-                """Handle Deepgram transcription."""
+            async def on_transcript(text: str, is_interim: bool = False):
+                """Handle Deepgram transcription.
+                
+                Args:
+                    text: Transcribed text
+                    is_interim: Whether this is an interim (partial) transcription
+                """
                 nonlocal current_transcription
                 current_transcription = text
-                transcribed_text_buffer.append(text)
-                logger.info(f"[Deepgram] 📝 Transcription received: {text}")
-                print(f"[Deepgram] 📝 Transcription: {text}")
+                
+                # Cancel any ongoing TTS immediately when user starts speaking
+                # This provides instant interruption without waiting for processing
+                if context and context.active_tts_task and not context.active_tts_task.done():
+                    # GRACE PERIOD: Don't cancel TTS for first 0.5 seconds after it starts
+                    # This prevents false positives from echo/feedback
+                    if hasattr(context, '_tts_start_time'):
+                        time_since_tts_start = time.time() - context._tts_start_time
+                        grace_period = 0.5  # 0.5 second grace period for Deepgram (shorter since it's more accurate)
+                        if time_since_tts_start < grace_period:
+                            logger.debug(f"[Deepgram] ⏱️ Ignoring speech during grace period ({time_since_tts_start:.2f}s < {grace_period}s)")
+                            return
+                    
+                    logger.info(f"[Deepgram] 🛑 User speech detected (interim={is_interim}) - cancelling TTS immediately")
+                    print(f"[Deepgram] 🛑 Cancelling TTS due to user speech...")
+                    
+                    # Cancel TTS immediately - this needs to happen FAST
+                    try:
+                        # Set cancellation event FIRST for immediate effect in the chunk loop
+                        if context.tts_cancellation_event is None:
+                            context.tts_cancellation_event = asyncio.Event()
+                        context.tts_cancellation_event.set()
+                        
+                        # Cancel the task immediately (this will raise CancelledError in the task)
+                        context.active_tts_task.cancel()
+                        
+                        # Send clear marker in background to clear Twilio buffer
+                        # This doesn't block the callback
+                        websocket = context.websocket
+                        stream_sid = getattr(context, 'stream_sid', None)
+                        if websocket and stream_sid:
+                            asyncio.create_task(self._send_clear_marker(websocket, stream_sid, context))
+                        
+                        logger.info(f"[Deepgram] ✅ TTS cancellation signal sent (task cancelled, event set)")
+                    except Exception as cancel_error:
+                        logger.warning(f"[Deepgram] Error cancelling TTS: {cancel_error}")
+                
+                # Only add to buffer if it's a final transcription (EndOfTurn)
+                # Interim transcriptions are used for interruption only
+                if not is_interim:
+                    transcribed_text_buffer.append(text)
+                    logger.info(f"[Deepgram] 📝 Final transcription received: {text}")
+                    print(f"[Deepgram] 📝 Final transcription: {text}")
+                else:
+                    logger.debug(f"[Deepgram] 📝 Interim transcription (interrupting TTS): {text}")
 
             async def on_transcript_error(error: Exception):
                 """Handle Deepgram error."""
@@ -218,14 +266,70 @@ class TwilioWebSocketHandler:
                         # Binary audio data - send to Deepgram
                         audio_bytes = message["bytes"]
                         audio_size = len(audio_bytes)
-                        logger.info(f"[Twilio] 🔊 Received binary audio data: {audio_size} bytes")
-                        print(f"[Twilio] 🔊 Received binary audio data: {audio_size} bytes")
                         
-                        # Log first few bytes for debugging (first 10 bytes as hex)
-                        if audio_size > 0:
-                            hex_preview = " ".join(f"{b:02x}" for b in audio_bytes[:10])
-                            logger.debug(f"[Twilio] Audio data preview (first 10 bytes): {hex_preview}")
-                            print(f"[Twilio] Audio data preview (first 10 bytes): {hex_preview}")
+                        # Check if user is speaking (receiving audio) while TTS is active
+                        # Cancel TTS immediately when we detect incoming audio with voice activity
+                        # Use a simple voice activity detection: check for audio variation
+                        if context and context.active_tts_task and not context.active_tts_task.done() and audio_size > 0:
+                            # Initialize voice activity tracking if not exists
+                            if not hasattr(context, '_voice_activity_chunks'):
+                                context._voice_activity_chunks = 0
+                                context._last_voice_check_time = time.time()
+                            
+                            # GRACE PERIOD: Don't check for voice activity for first 1 second after TTS starts
+                            # This prevents false positives from echo/feedback
+                            if not hasattr(context, '_tts_start_time'):
+                                context._tts_start_time = time.time()
+                            
+                            time_since_tts_start = time.time() - context._tts_start_time
+                            grace_period = 1.0  # 1 second grace period
+                            
+                            if time_since_tts_start < grace_period:
+                                # Still in grace period - ignore voice activity
+                                logger.debug(f"[Twilio] ⏱️ Grace period active ({time_since_tts_start:.2f}s < {grace_period}s) - ignoring voice activity")
+                                continue
+                            
+                            # Check if audio contains actual voice (not just silence or echo)
+                            # μ-law silence is typically 0xFF or 0x00, check for variation
+                            audio_variation = max(audio_bytes) - min(audio_bytes) if audio_bytes else 0
+                            # Also check for non-silence bytes (not all 0xFF or 0x00)
+                            non_silence_ratio = sum(1 for b in audio_bytes if b != 0xFF and b != 0x00) / len(audio_bytes) if audio_bytes else 0
+                            
+                            # INCREASED THRESHOLDS: More strict to avoid false positives
+                            # Voice activity threshold: variation > 30 AND at least 40% non-silence
+                            # (Increased from 15/20% to 30/40% to be less sensitive)
+                            if audio_variation > 30 and non_silence_ratio > 0.4:
+                                context._voice_activity_chunks += 1
+                                # Require sustained voice activity (at least 3 chunks ~60ms) to avoid false positives
+                                if context._voice_activity_chunks >= 3:
+                                    logger.info(f"[Twilio] 🛑 Sustained voice activity detected (chunks={context._voice_activity_chunks}, variation={audio_variation}, non_silence={non_silence_ratio:.2%}, time_since_tts={time_since_tts_start:.2f}s) - cancelling TTS")
+                                    print(f"[Twilio] 🛑 Sustained voice activity detected (chunks={context._voice_activity_chunks}, variation={audio_variation}, non_silence={non_silence_ratio:.2%}, time_since_tts={time_since_tts_start:.2f}s) - cancelling TTS")
+                                    logger.info(f"[Twilio] 📊 Voice activity stats: audio_size={audio_size}, max={max(audio_bytes) if audio_bytes else 0}, min={min(audio_bytes) if audio_bytes else 0}")
+                                    print(f"[Twilio] 📊 Voice activity stats: audio_size={audio_size}, max={max(audio_bytes) if audio_bytes else 0}, min={min(audio_bytes) if audio_bytes else 0}")
+                                    # Set cancellation event immediately
+                                    if context.tts_cancellation_event is None:
+                                        context.tts_cancellation_event = asyncio.Event()
+                                    context.tts_cancellation_event.set()
+                                    # Cancel task and send clear marker
+                                    context.active_tts_task.cancel()
+                                    stream_sid = getattr(context, 'stream_sid', None)
+                                    if stream_sid:
+                                        asyncio.create_task(self._send_clear_marker(websocket, stream_sid, context))
+                                    # Reset voice activity tracking
+                                    context._voice_activity_chunks = 0
+                            else:
+                                # Reset counter if no voice activity
+                                context._voice_activity_chunks = 0
+                        
+                        # Only log first few binary messages to avoid spam
+                        if binary_message_count <= 3:
+                            logger.info(f"[Twilio] 🔊 Received binary audio data: {audio_size} bytes")
+                            print(f"[Twilio] 🔊 Received binary audio data: {audio_size} bytes")
+                            
+                            # Log first few bytes for debugging (first 10 bytes as hex)
+                            if audio_size > 0:
+                                hex_preview = " ".join(f"{b:02x}" for b in audio_bytes[:10])
+                                logger.debug(f"[Twilio] Audio data preview (first 10 bytes): {hex_preview}")
                         
                         # Send to Deepgram if connection exists
                         if deepgram_connection:
@@ -307,6 +411,54 @@ class TwilioWebSocketHandler:
                                         audio_size = len(audio_bytes)
                                         binary_message_count += 1  # Count this as audio data received
                                         
+                                        # Check if user is speaking (receiving audio) while TTS is active
+                                        # Cancel TTS immediately when we detect incoming audio with voice activity
+                                        if context and context.active_tts_task and not context.active_tts_task.done() and audio_size > 0:
+                                            # Initialize voice activity tracking if not exists
+                                            if not hasattr(context, '_voice_activity_chunks'):
+                                                context._voice_activity_chunks = 0
+                                            
+                                            # GRACE PERIOD: Don't check for voice activity for first 1 second after TTS starts
+                                            # This prevents false positives from echo/feedback
+                                            if not hasattr(context, '_tts_start_time'):
+                                                context._tts_start_time = time.time()
+                                            
+                                            time_since_tts_start = time.time() - context._tts_start_time
+                                            grace_period = 1.0  # 1 second grace period
+                                            
+                                            if time_since_tts_start < grace_period:
+                                                # Still in grace period - ignore voice activity
+                                                logger.debug(f"[Twilio] ⏱️ Grace period active ({time_since_tts_start:.2f}s < {grace_period}s) - ignoring voice activity")
+                                                continue
+                                            
+                                            # Check if audio contains actual voice (not just silence or echo)
+                                            audio_variation = max(audio_bytes) - min(audio_bytes) if audio_bytes else 0
+                                            non_silence_ratio = sum(1 for b in audio_bytes if b != 0xFF and b != 0x00) / len(audio_bytes) if audio_bytes else 0
+                                            
+                                            # INCREASED THRESHOLDS: More strict to avoid false positives
+                                            # Voice activity threshold: variation > 30 AND at least 40% non-silence
+                                            # (Increased from 15/20% to 30/40% to be less sensitive)
+                                            if audio_variation > 30 and non_silence_ratio > 0.4:
+                                                context._voice_activity_chunks += 1
+                                                # Require sustained voice activity (at least 3 chunks ~60ms) to avoid false positives
+                                                if context._voice_activity_chunks >= 3:
+                                                    logger.info(f"[Twilio] 🛑 Sustained voice activity detected (chunks={context._voice_activity_chunks}, variation={audio_variation}, non_silence={non_silence_ratio:.2%}, time_since_tts={time_since_tts_start:.2f}s) - cancelling TTS")
+                                                    print(f"[Twilio] 🛑 Sustained voice activity detected (chunks={context._voice_activity_chunks}, variation={audio_variation}, non_silence={non_silence_ratio:.2%}, time_since_tts={time_since_tts_start:.2f}s) - cancelling TTS")
+                                                    # Set cancellation event immediately
+                                                    if context.tts_cancellation_event is None:
+                                                        context.tts_cancellation_event = asyncio.Event()
+                                                    context.tts_cancellation_event.set()
+                                                    # Cancel task and send clear marker
+                                                    context.active_tts_task.cancel()
+                                                    stream_sid = getattr(context, 'stream_sid', None)
+                                                    if stream_sid:
+                                                        asyncio.create_task(self._send_clear_marker(websocket, stream_sid, context))
+                                                    # Reset voice activity tracking
+                                                    context._voice_activity_chunks = 0
+                                            else:
+                                                # Reset counter if no voice activity
+                                                context._voice_activity_chunks = 0
+                                        
                                         # Only log occasionally to reduce spam (every 50th chunk)
                                         if binary_message_count % 50 == 0:
                                             logger.debug(f"[Twilio] Audio chunks received: {binary_message_count} ({audio_size} bytes each)")
@@ -372,6 +524,13 @@ class TwilioWebSocketHandler:
             if connection_key and connection_key in self.active_connections:
                 del self.active_connections[connection_key]
 
+            # Cancel any ongoing TTS before closing
+            if 'context' in locals() and context:
+                try:
+                    await self._cancel_ongoing_tts(context)
+                except Exception as e:
+                    logger.warning(f"[Twilio] Error cancelling TTS during cleanup: {e}")
+
             # Close Deepgram connection
             if deepgram_connection:
                 try:
@@ -388,6 +547,7 @@ class TwilioWebSocketHandler:
     ):
         """
         Process a user utterance: RAG → LLM → Tool execution → TTS → Send audio.
+        This method will cancel any ongoing TTS before processing new utterance.
 
         Args:
             transcribed_text: User's transcribed text
@@ -396,6 +556,9 @@ class TwilioWebSocketHandler:
         try:
             logger.info(f"[Processing] 🎯 Processing utterance: {transcribed_text}")
             print(f"[Processing] 🎯 Processing: {transcribed_text}")
+            
+            # Cancel any ongoing TTS before processing new utterance
+            await self._cancel_ongoing_tts(context)
             
             # Add user message to conversation history
             context.add_user_message(transcribed_text)
@@ -416,21 +579,165 @@ class TwilioWebSocketHandler:
                 tools=context.tools,
             )
 
+            # Log LLM raw response
+            logger.info(f"[LLM] 📤 Raw LLM response: type={llm_response.get('type')}, content={llm_response.get('content', '')[:200]}...")
+            print(f"[LLM] 📤 Raw LLM response: type={llm_response.get('type')}, content={llm_response.get('content', '')[:200]}...")
+
             # Handle LLM response
             final_response_text = await self._handle_llm_response(
                 llm_response=llm_response,
                 context=context,
             )
 
+            # Log final response text that will be converted to TTS
             if final_response_text:
-                # Convert to speech and send
-                await self._send_tts_response(final_response_text, context)
+                logger.info(f"[LLM] 🎤 Text to convert to TTS ({len(final_response_text)} chars): {final_response_text[:300]}...")
+                print(f"[LLM] 🎤 Text to convert to TTS ({len(final_response_text)} chars): {final_response_text[:300]}...")
+            else:
+                logger.warning(f"[LLM] ⚠️ No final response text - TTS will not be generated")
+                print(f"[LLM] ⚠️ No final response text - TTS will not be generated")
+
+            if final_response_text:
+                # Convert to speech and send (as a tracked task)
+                # Create task with cleanup wrapper
+                async def send_tts_with_cleanup():
+                    """Wrapper to ensure TTS task is cleaned up when done."""
+                    try:
+                        await self._send_tts_response(final_response_text, context)
+                    finally:
+                        # Clear task reference when done (only if still set to this task)
+                        # Use asyncio.current_task() to get the current task
+                        current_task = asyncio.current_task()
+                        if context.active_tts_task is current_task:
+                            context.active_tts_task = None
+                
+                # Create and track the TTS task
+                tts_task = asyncio.create_task(send_tts_with_cleanup())
+                context.active_tts_task = tts_task
+                
+                # Don't await - let it run in background so we can interrupt it
+                # The task will be cleaned up when it completes or is cancelled
 
         except Exception as e:
             print(f"Error processing utterance: {e}")
+            logger.error(f"[Processing] Error processing utterance: {e}", exc_info=True)
             # Send error message via TTS
             error_message = "I apologize, but I encountered an error processing your request."
-            await self._send_tts_response(error_message, context)
+            
+            async def send_error_tts_with_cleanup():
+                """Wrapper to ensure error TTS task is cleaned up when done."""
+                try:
+                    await self._send_tts_response(error_message, context)
+                finally:
+                    # Clear task reference when done (only if still set to this task)
+                    current_task = asyncio.current_task()
+                    if context.active_tts_task is current_task:
+                        context.active_tts_task = None
+            
+            error_tts_task = asyncio.create_task(send_error_tts_with_cleanup())
+            context.active_tts_task = error_tts_task
+    
+    async def _cancel_ongoing_tts(self, context):
+        """
+        Cancel any ongoing TTS operation for the given context.
+        This also sends a marker to Twilio to clear the audio buffer.
+
+        Args:
+            context: ConversationContext
+        """
+        try:
+            # Cancel any active TTS task
+            if context.active_tts_task and not context.active_tts_task.done():
+                logger.info("[TTS] ⚠️ Cancelling ongoing TTS task due to new utterance")
+                print("[TTS] ⚠️ Cancelling ongoing TTS...")
+                
+                # Set cancellation event FIRST - this will stop the chunk loop immediately
+                if context.tts_cancellation_event:
+                    context.tts_cancellation_event.set()
+                
+                # Send marker to clear Twilio buffer immediately
+                websocket = context.websocket
+                stream_sid = getattr(context, 'stream_sid', None)
+                if websocket and stream_sid:
+                    try:
+                        await self._send_clear_marker(websocket, stream_sid, context)
+                    except Exception as marker_error:
+                        logger.warning(f"[TTS] Error sending clear marker: {marker_error}")
+                
+                # Cancel the task
+                context.active_tts_task.cancel()
+                
+                # Wait for cancellation to complete (with shorter timeout for faster response)
+                try:
+                    await asyncio.wait_for(context.active_tts_task, timeout=0.1)
+                except asyncio.TimeoutError:
+                    logger.debug("[TTS] TTS task cancellation timeout (task may continue in background)")
+                except asyncio.CancelledError:
+                    # Task was successfully cancelled
+                    logger.info("[TTS] ✅ TTS task cancelled successfully")
+                    pass
+                except Exception as e:
+                    logger.warning(f"[TTS] Error during TTS cancellation: {e}")
+                
+                # Clear the task reference
+                context.active_tts_task = None
+            
+            # Reset cancellation event for new TTS operation
+            if context.tts_cancellation_event:
+                context.tts_cancellation_event.clear()
+                
+        except Exception as e:
+            logger.error(f"[TTS] Error cancelling TTS: {e}", exc_info=True)
+    
+    async def _send_clear_marker(self, websocket, stream_sid: str, context):
+        """
+        Send a marker to Twilio to clear the audio buffer.
+        This helps stop playback of buffered audio immediately.
+
+        Args:
+            websocket: WebSocket connection
+            stream_sid: Twilio stream SID
+            context: ConversationContext (for logging)
+        """
+        try:
+            # Send a marker event to clear the buffer
+            # According to Twilio docs, markers can be used to track playback
+            # We'll use a unique marker name to signal buffer clearing
+            import uuid
+            marker_name = f"clear_{uuid.uuid4().hex[:8]}"
+            
+            marker_message = {
+                "event": "mark",
+                "streamSid": stream_sid,
+                "mark": {
+                    "name": marker_name
+                }
+            }
+            
+            await websocket.send_text(json.dumps(marker_message))
+            logger.info(f"[TTS] 📍 Sent clear marker to Twilio: {marker_name}")
+            
+            # Also send a few empty/silence chunks to help clear the buffer
+            # Twilio may continue playing buffered audio, so we send silence
+            # Generate 20ms of silence (160 bytes of μ-law silence = 0xFF)
+            silence_chunk = bytes([0xFF] * 160)
+            
+            # Send 5 silence chunks (100ms total) to help flush buffer
+            for _ in range(5):
+                encoded_payload = base64.b64encode(silence_chunk).decode('utf-8')
+                silence_message = {
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {
+                        "payload": encoded_payload
+                    }
+                }
+                await websocket.send_text(json.dumps(silence_message))
+            
+            logger.debug("[TTS] Sent silence chunks to help clear buffer")
+            
+        except Exception as e:
+            logger.warning(f"[TTS] Error sending clear marker: {e}")
 
     async def _handle_llm_response(
         self, llm_response: Dict[str, Any], context
@@ -450,6 +757,8 @@ class TwilioWebSocketHandler:
         if response_type == "text":
             # Regular text response
             text = llm_response.get("content", "")
+            logger.info(f"[LLM] 📝 Text response received: {text[:200]}...")
+            print(f"[LLM] 📝 Text response received: {text[:200]}...")
             if text:
                 context.add_assistant_message(text)
             return text
@@ -458,15 +767,33 @@ class TwilioWebSocketHandler:
             # LLM wants to call a tool
             tool_name = llm_response.get("tool_name")
             tool_arguments = llm_response.get("tool_arguments", {})
+            
+            logger.info(f"[Twilio] 🔧 LLM requested tool call: {tool_name} with args: {tool_arguments}")
+            print(f"[Twilio] 🔧 LLM requested tool call: {tool_name} with args: {tool_arguments}")
+            
+            # IMPORTANT: Add the assistant's tool call message to conversation history
+            # This is required for Cerebras API to match the tool_call_id
+            assistant_message = llm_response.get("assistant_message")
+            if assistant_message:
+                # Add assistant's message with tool call to conversation history
+                context.conversation_history.append(assistant_message)
 
             # Find tool definition
             tool_definition = None
+            logger.info(f"[Twilio] 🔍 Looking for tool: {tool_name} in {len(context.tools)} available tools")
+            print(f"[Twilio] 🔍 Looking for tool: {tool_name} in {len(context.tools)} available tools")
             for tool in context.tools:
+                logger.info(f"[Twilio] 📋 Available tool: {tool.tool_name} (ID: {tool.tool_id})")
+                print(f"[Twilio] 📋 Available tool: {tool.tool_name} (ID: {tool.tool_id})")
                 if tool.tool_name == tool_name:
                     tool_definition = tool
+                    logger.info(f"[Twilio] ✅ Found tool definition: {tool.tool_name}, parameters: {tool.parameters}")
+                    print(f"[Twilio] ✅ Found tool definition: {tool.tool_name}, parameters: {tool.parameters}")
                     break
 
             if not tool_definition:
+                logger.error(f"[Twilio] ❌ Tool '{tool_name}' not found in available tools")
+                print(f"[Twilio] ❌ Tool '{tool_name}' not found in available tools")
                 return f"I apologize, but I couldn't find the tool '{tool_name}'."
 
             # Check if it's end_call tool
@@ -490,12 +817,15 @@ class TwilioWebSocketHandler:
                 tool_result_str = json.dumps(tool_result, indent=2)
 
             # Send tool result back to LLM
+            # Get tool_call_id from the original LLM response if available
+            tool_call_id = llm_response.get("tool_call_id", "call_1")
             llm_final_response = await llm_service.generate_response_with_tool_result(
                 agent_prompt=context.prompt,
                 conversation_history=context.conversation_history,
                 tool_name=tool_name,
                 tool_result=tool_result_str,
                 tools=context.tools,
+                tool_call_id=tool_call_id,
             )
 
             # Handle final response (could be text or another tool call)
@@ -506,12 +836,20 @@ class TwilioWebSocketHandler:
     async def _send_tts_response(self, text: str, context):
         """
         Convert text to speech and send audio to client.
+        This method is cancellable - will stop sending chunks if interrupted.
 
         Args:
             text: Text to convert to speech
             context: ConversationContext
         """
         try:
+            # Initialize cancellation event if it doesn't exist
+            if context.tts_cancellation_event is None:
+                context.tts_cancellation_event = asyncio.Event()
+            else:
+                # Reset the event for new TTS operation
+                context.tts_cancellation_event.clear()
+            
             # Check if WebSocket is still open before sending
             websocket = context.websocket
             if not websocket:
@@ -528,13 +866,37 @@ class TwilioWebSocketHandler:
                 # If we can't check state, try to send anyway (will fail gracefully)
                 pass
             
+            # Check for cancellation before generating TTS (user might have interrupted already)
+            if context.tts_cancellation_event.is_set():
+                logger.info("[TTS] TTS cancelled before generation")
+                return
+            
             # Convert text to speech
+            logger.info(f"[TTS] 🎙️ Converting to speech: {text[:200]}...")
+            print(f"[TTS] 🎙️ Converting to speech: {text[:200]}...")
+            
+            # Mark TTS start time for grace period
+            if context:
+                context._tts_start_time = time.time()
+                logger.info(f"[TTS] ⏱️ TTS start time recorded - grace period active for 1 second")
+                print(f"[TTS] ⏱️ TTS start time recorded - grace period active for 1 second")
+            
             audio_bytes = await tts_service.text_to_speech(text)
+            
+            # Check for cancellation after TTS generation
+            if context.tts_cancellation_event.is_set():
+                logger.info("[TTS] TTS cancelled after generation")
+                return
 
             if audio_bytes:
                 # Convert audio to μ-law format for Twilio Media Streams
                 # Twilio expects: μ-law (mulaw) PCM, 8000 Hz, mono
                 mulaw_audio = await self._convert_to_mulaw(audio_bytes)
+                
+                # Check for cancellation after audio conversion
+                if context.tts_cancellation_event.is_set():
+                    logger.info("[TTS] TTS cancelled after audio conversion")
+                    return
                 
                 if mulaw_audio:
                     # Send audio to Twilio via WebSocket as JSON messages with base64-encoded payload
@@ -551,6 +913,22 @@ class TwilioWebSocketHandler:
                     total_chunks = 0
                     
                     for i in range(0, len(mulaw_audio), chunk_size):
+                        # Check for cancellation BEFORE processing chunk (most frequent check)
+                        if context.tts_cancellation_event.is_set():
+                            logger.info(f"[TTS] TTS interrupted after {total_chunks} chunks")
+                            # Send marker to clear Twilio buffer
+                            await self._send_clear_marker(websocket, stream_sid, context)
+                            break
+                        
+                        # Yield to event loop to allow cancellation to be processed BEFORE sending
+                        await asyncio.sleep(0)
+                        
+                        # Check again after yielding (cancellation might have happened during yield)
+                        if context.tts_cancellation_event.is_set():
+                            logger.info(f"[TTS] TTS interrupted after {total_chunks} chunks (after yield)")
+                            await self._send_clear_marker(websocket, stream_sid, context)
+                            break
+                        
                         chunk = mulaw_audio[i:i + chunk_size]
                         if chunk:
                             # Base64 encode the chunk
@@ -566,14 +944,33 @@ class TwilioWebSocketHandler:
                             }
                             
                             # Send as JSON text message
-                            await websocket.send_text(json.dumps(media_message))
-                            total_chunks += 1
-                            # No delay needed - Twilio will buffer and play chunks smoothly
+                            try:
+                                # Check one more time right before the potentially blocking send
+                                if context.tts_cancellation_event.is_set():
+                                    logger.info(f"[TTS] TTS interrupted right before sending chunk")
+                                    await self._send_clear_marker(websocket, stream_sid, context)
+                                    break
+                                
+                                await websocket.send_text(json.dumps(media_message))
+                                total_chunks += 1
+                            except Exception as send_error:
+                                # If send fails (connection closed), stop sending
+                                logger.warning(f"[TTS] Error sending chunk: {send_error}")
+                                break
                     
-                    logger.info(f"[TTS] ✅ Sent {len(mulaw_audio)} bytes of μ-law audio in {total_chunks} JSON messages to Twilio")
+                    if not context.tts_cancellation_event.is_set():
+                        logger.info(f"[TTS] ✅ Sent {len(mulaw_audio)} bytes of μ-law audio in {total_chunks} JSON messages to Twilio")
+                    else:
+                        logger.info(f"[TTS] ⚠️ TTS interrupted - sent {total_chunks} chunks before cancellation")
                 else:
                     logger.warning("[TTS] Failed to convert audio to μ-law format")
 
+        except asyncio.CancelledError:
+            # Handle task cancellation gracefully
+            logger.info("[TTS] TTS task cancelled")
+            if context.tts_cancellation_event:
+                context.tts_cancellation_event.set()
+            raise
         except Exception as e:
             # Don't log errors if WebSocket is already closed
             error_str = str(e)

@@ -3,6 +3,7 @@ FastAPI application entry point.
 """
 import logging
 from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
@@ -27,6 +28,15 @@ app = FastAPI(
     description="Multi-agent workspace with voice capabilities",
     version="0.1.0",
     debug=settings.debug,
+)
+
+# Add CORS middleware - allow all origins for development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Add middleware to log WebSocket connection attempts

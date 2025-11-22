@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.schemas import AgentResponse
+from app.models.tool import Tool
 from app.services.agent_service import (
     process_csv_and_create_embeddings,
     save_faiss_index,
@@ -56,7 +57,7 @@ async def create_agent(
         from uuid import uuid4
         namespace = f"{settings.default_agent_namespace_prefix}{uuid4().hex[:8]}"
     
-    # Parse tool IDs if provided
+    # Parse tool IDs if provided, otherwise fetch all tool IDs from database
     parsed_tool_ids: Optional[List[UUID]] = None
     if tool_ids:
         try:
@@ -66,6 +67,10 @@ async def create_agent(
                 status_code=400,
                 detail=f"Invalid tool ID format: {str(e)}"
             )
+    else:
+        # If tool_ids not provided, fetch all tool IDs from database
+        all_tools = db.query(Tool).all()
+        parsed_tool_ids = [tool.tool_id for tool in all_tools]
     
     # Process CSV and create embeddings
     try:

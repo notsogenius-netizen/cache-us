@@ -6,8 +6,11 @@ import re
 import shlex
 import httpx
 import json
+import logging
 
 from app.models.tool import Tool
+
+logger = logging.getLogger(__name__)
 
 
 class ToolExecutor:
@@ -27,6 +30,9 @@ class ToolExecutor:
         Returns:
             Dict with execution result
         """
+        logger.info(f"[ToolExecutor] 🔧 Executing tool: {tool_name} with arguments: {tool_arguments}")
+        print(f"[ToolExecutor] 🔧 Executing tool: {tool_name} with arguments: {tool_arguments}")
+        
         # Handle special tools
         if tool_name == "end_call":
             return {"action": "end_call", "status": "success"}
@@ -49,13 +55,38 @@ class ToolExecutor:
                 "error": "Failed to parse curl command",
             }
 
-        # Substitute arguments into curl command if needed
-        # For now, we'll execute the curl as-is
-        # You can enhance this to substitute values from tool_arguments
+        # Substitute arguments into parsed request
+        # Merge tool_arguments into the data/body if it's a dict
+        if tool_arguments and parsed_request.get("data"):
+            if isinstance(parsed_request["data"], dict):
+                # Merge tool arguments into existing data
+                parsed_request["data"].update(tool_arguments)
+            else:
+                # If data is a string, try to parse as JSON and merge
+                try:
+                    data_dict = json.loads(parsed_request["data"])
+                    if isinstance(data_dict, dict):
+                        data_dict.update(tool_arguments)
+                        parsed_request["data"] = data_dict
+                except:
+                    # If parsing fails, use tool_arguments as the data
+                    parsed_request["data"] = tool_arguments
+        elif tool_arguments and not parsed_request.get("data"):
+            # If no data in curl command but we have arguments, use arguments as data
+            parsed_request["data"] = tool_arguments
         
         # Execute HTTP request
+        logger.info(f"[ToolExecutor] 🌐 Making {parsed_request['method']} request to: {parsed_request['url']}")
+        logger.info(f"[ToolExecutor] 📦 Request data: {parsed_request.get('data')}")
+        print(f"[ToolExecutor] 🌐 Making {parsed_request['method']} request to: {parsed_request['url']}")
+        print(f"[ToolExecutor] 📦 Request data: {parsed_request.get('data')}")
+        
         try:
             result = await self._execute_http_request(parsed_request)
+            logger.info(f"[ToolExecutor] ✅ Tool execution result: status={result.get('status')}, status_code={result.get('status_code')}")
+            print(f"[ToolExecutor] ✅ Tool execution result: status={result.get('status')}, status_code={result.get('status_code')}")
+            if result.get('body'):
+                logger.debug(f"[ToolExecutor] 📄 Response body: {result.get('body')[:200]}...")
             return result
         except Exception as e:
             return {

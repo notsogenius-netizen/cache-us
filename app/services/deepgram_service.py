@@ -53,12 +53,15 @@ class DeepgramService:
         
         # Track the latest transcript for end-of-turn detection
         latest_transcript = ""
+        last_interim_callback_time = 0  # Track when we last called interim callback
+        INTERIM_CALLBACK_THROTTLE = 0.5  # Only call interim callback every 500ms
         
         # Define message handler function (as per Flux docs)
         def on_message(message: ListenV2SocketClientResponse) -> None:
             """Handle transcription message from Deepgram Flux."""
-            nonlocal latest_transcript
+            nonlocal latest_transcript, last_interim_callback_time
             try:
+                import time
                 # Check message type - ListenV2TurnInfoEvent is the Flux turn info event
                 message_type = type(message).__name__
                 
@@ -76,13 +79,22 @@ class DeepgramService:
                             pass
                     on_message._logged_attributes = True
                 
-                # Check for transcript attribute
-                transcript_value = getattr(message, 'transcript', None) if hasattr(message, 'transcript') else None
+                # Check for transcript attribute (try multiple possible attribute names)
+                transcript_value = None
+                if hasattr(message, 'transcript'):
+                    transcript_value = getattr(message, 'transcript', None)
+                elif hasattr(message, 'text'):
+                    transcript_value = getattr(message, 'text', None)
+                elif hasattr(message, 'message'):
+                    transcript_value = getattr(message, 'message', None)
+                
+                # Log message details for debugging
+                logger.debug(f"[Deepgram] Message type: {message_type}, transcript_value: {transcript_value}")
                 
                 # Update latest transcript if this is a transcript message
                 if transcript_value:
                     latest_transcript = transcript_value
-                    logger.debug(f"[Deepgram] Transcript update: {latest_transcript}")
+                    logger.info(f"[Deepgram] 📝 Transcript update received: {latest_transcript}")
                 
                 # Check for EndOfTurn - ListenV2TurnInfoEvent has an 'event' attribute
                 # Check various possible attributes for EndOfTurn detection
@@ -105,21 +117,70 @@ class DeepgramService:
                     is_end_of_turn = True
                     logger.info(f"[Deepgram] ✅ EndOfTurn detected via is_final flag")
                 
-                # Only process on EndOfTurn to avoid duplicate processing
+                # Call callback for interim transcriptions to enable immediate TTS interruption
+                # This allows cancelling TTS as soon as speech is detected, not just on EndOfTurn
+                # Check if we have a transcript update (even if not EndOfTurn)
+                if transcript_value and latest_transcript and len(latest_transcript.strip()) > 1:
+                    # Check if this is an interim transcription (not EndOfTurn)
+                    is_interim = not is_end_of_turn
+                    
+                    if is_interim:
+                        # Throttle interim callbacks to avoid excessive calls
+                        current_time = time.time()
+                        if current_time - last_interim_callback_time >= INTERIM_CALLBACK_THROTTLE:
+                            # For interim transcriptions, call callback to interrupt TTS
+                            # This provides instant interruption as soon as user starts speaking
+                            logger.info(f"[Deepgram] 🛑 INTERIM transcript detected (for interruption): {latest_transcript}")
+                            last_interim_callback_time = current_time
+                            try:
+                                # Call with is_interim=True to indicate this is a partial transcription
+                                if asyncio.iscoroutinefunction(on_transcript):
+                                    # Check if callback accepts is_interim parameter
+                                    import inspect
+                                    sig = inspect.signature(on_transcript)
+                                    if 'is_interim' in sig.parameters:
+                                        asyncio.create_task(on_transcript(latest_transcript, is_interim=True))
+                                    else:
+                                        # Old callback signature - call it anyway to trigger cancellation
+                                        asyncio.create_task(on_transcript(latest_transcript))
+                                else:
+                                    # Sync callback - try to call with is_interim if supported
+                                    import inspect
+                                    sig = inspect.signature(on_transcript)
+                                    if 'is_interim' in sig.parameters:
+                                        on_transcript(latest_transcript, is_interim=True)
+                                    else:
+                                        on_transcript(latest_transcript)
+                            except Exception as e:
+                                logger.warning(f"[Deepgram] Error calling interim callback: {e}")
+                    else:
+                        logger.debug(f"[Deepgram] Transcript update is EndOfTurn, will process later: {latest_transcript}")
+                
+                # Process final transcript on EndOfTurn
                 if is_end_of_turn:
                     if latest_transcript and len(latest_transcript.strip()) > 2:  # Filter out very short fragments
                         logger.info(f"[Deepgram] ✅ EndOfTurn - Processing final transcript: {latest_transcript}")
-                        # Call the callback with final transcribed text
-                        if asyncio.iscoroutinefunction(on_transcript):
-                            asyncio.create_task(on_transcript(latest_transcript))
-                        else:
-                            on_transcript(latest_transcript)
+                        # Call the callback with final transcribed text (is_interim=False)
+                        try:
+                            if asyncio.iscoroutinefunction(on_transcript):
+                                import inspect
+                                sig = inspect.signature(on_transcript)
+                                if 'is_interim' in sig.parameters:
+                                    asyncio.create_task(on_transcript(latest_transcript, is_interim=False))
+                                else:
+                                    asyncio.create_task(on_transcript(latest_transcript))
+                            else:
+                                import inspect
+                                sig = inspect.signature(on_transcript)
+                                if 'is_interim' in sig.parameters:
+                                    on_transcript(latest_transcript, is_interim=False)
+                                else:
+                                    on_transcript(latest_transcript)
+                        except Exception as e:
+                            logger.warning(f"[Deepgram] Error calling final callback: {e}")
                         latest_transcript = ""  # Reset after processing
                     else:
                         logger.debug(f"[Deepgram] EndOfTurn but transcript too short, skipping: {latest_transcript}")
-                # For regular transcript updates, just track but don't process
-                elif transcript_value:
-                    logger.debug(f"[Deepgram] Transcript update (not EndOfTurn): {transcript_value}")
             except Exception as e:
                 logger.error(f"[Deepgram] Error handling transcript: {e}", exc_info=True)
                 if on_error:
