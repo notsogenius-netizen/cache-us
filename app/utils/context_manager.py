@@ -3,14 +3,19 @@ Context manager for caching conversation context per phone number.
 """
 from typing import Dict, Optional, List, Any
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
+from urllib.parse import quote, unquote
 
 from app.models.agent import Agent
 from app.models.tool import Tool
-from app.models.agent_tool import AgentTool
 from app.core.database import SessionLocal
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 class ConversationContext:
@@ -32,6 +37,7 @@ class ConversationContext:
         self.conversation_history: List[Dict[str, str]] = []
         self.created_at = datetime.now()
         self.last_activity = datetime.now()
+        self.stream_sid: Optional[str] = None  # Stream SID for sending audio back
 
     def add_user_message(self, text: str):
         """Add user message to conversation history."""
@@ -60,21 +66,24 @@ class ContextManager:
         self._cleanup_interval = 60  # Check every minute
 
     async def get_or_create_context(
-        self, phone_number: str, websocket: Any
+        self, phone_number: Optional[str], websocket: Any
     ) -> Optional[ConversationContext]:
         """
         Get existing context or create new one for phone number.
 
         Args:
-            phone_number: Phone number
+            phone_number: Phone number (optional, if None will use first available agent)
             websocket: WebSocket connection
 
         Returns:
             ConversationContext or None if agent not found
         """
+        # Use a default key if no phone number provided
+        context_key = phone_number or "default"
+        
         # Check if context exists
-        if phone_number in self._contexts:
-            context = self._contexts[phone_number]
+        if context_key in self._contexts:
+            context = self._contexts[context_key]
             context.websocket = websocket  # Update websocket
             context.last_activity = datetime.now()
             return context
@@ -82,32 +91,54 @@ class ContextManager:
         # Create new context - fetch agent from database
         db = SessionLocal()
         try:
-            # Fetch agent by phone number
-            agent = db.query(Agent).filter(Agent.phone_number == phone_number).first()
+            agent = None
+            
+            # If phone_number is provided, try to fetch by phone number first
+            if phone_number:
+                # Fetch agent by phone number
+                # Try both formats: decoded (+17245422869) and URL-encoded (%2B17245422869)
+                # This handles cases where the database might have stored the URL-encoded version
+                agent = db.query(Agent).filter(Agent.phone_number == phone_number).first()
+                
+                # If not found, try URL-encoded version
+                if not agent:
+                    url_encoded_phone = quote(phone_number, safe='')
+                    agent = db.query(Agent).filter(Agent.phone_number == url_encoded_phone).first()
+                
+                # If still not found, try decoding the phone number (in case DB has encoded version)
+                if not agent and phone_number.startswith('%'):
+                    decoded_phone = unquote(phone_number)
+                    agent = db.query(Agent).filter(Agent.phone_number == decoded_phone).first()
+            
+            # If no agent found by phone number (or no phone number provided), get the first available agent
+            if not agent:
+                agent = db.query(Agent).first()
+                if agent:
+                    print(f"[ContextManager] Using first available agent (namespace: {agent.namespace})")
+                    logger.info(f"[ContextManager] Using first available agent (namespace: {agent.namespace})")
             
             if not agent:
+                print(f"[ContextManager] No agent found in database")
+                logger.error("[ContextManager] No agent found in database")
                 return None
 
-            # Fetch tools for agent
-            agent_tools = (
-                db.query(AgentTool)
-                .filter(AgentTool.agent_id == agent.ag_id)
-                .all()
-            )
-            
-            tool_ids = [at.tool_id for at in agent_tools]
+            # Fetch tools for agent using tool_ids array from agent
+            tool_ids = agent.tool_ids if agent.tool_ids else []
             tools = db.query(Tool).filter(Tool.tool_id.in_(tool_ids)).all() if tool_ids else []
 
             # Create context
+            # Use agent's phone_number if available, otherwise use provided or default
+            context_phone = agent.phone_number or phone_number or "default"
+            
             context = ConversationContext(
-                phone_number=phone_number,
+                phone_number=context_phone,
                 agent=agent,
                 tools=tools,
                 websocket=websocket,
             )
 
-            # Store in cache
-            self._contexts[phone_number] = context
+            # Store in cache using the context key
+            self._contexts[context_key] = context
 
             return context
 

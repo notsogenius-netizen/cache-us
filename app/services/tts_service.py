@@ -34,6 +34,7 @@ class TTSService:
             
             # Generate audio using ElevenLabs
             # Use the text_to_speech API
+            # ElevenLabs returns MP3 by default
             response = self.client.text_to_speech.convert(
                 voice_id=voice_id_to_use,
                 text=text,

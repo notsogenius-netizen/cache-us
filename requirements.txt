@@ -19,6 +19,8 @@ deepgram-sdk
 
 # TTS - ElevenLabs
 elevenlabs
+pydub
+audioop-lts  # Backport of audioop for Python 3.13+
 
 # Vector DB - FAISS
 faiss-cpu
